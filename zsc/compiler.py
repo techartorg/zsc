@@ -1,59 +1,57 @@
-# zsc.py
-
 import io
 import ast
 import logging
-import argparse
+
+from .prepass import ParseError, Prepass
+
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.DEBUG)
 
 
 WARN_ON_COMPARISONS = True
 
 VERSION = '0.1.0'
 
-# these could be imported from 'zbrush'
-# or math.  this is not a 1:1 match  with
-# zbrush's list, some of those are handled
-# by python constucts, such as "-x -> [NEG, #x]"
-KNOWN_MATH_FUNCS = {
-    "sin": "SIN",
-    "cos": "COS",
-    "tan": "TAN",
-    "asin": "ASIN",
-    "acos": "ACOS",
-    "atan": "ATAN",
-    "atan2": "ATAN2",
-    "log": "LOG",
-    "log10": "LOG10",
-    "sqrt": "SQRT",
-    "abs": "ABS",
-    "random": "RAND", 
-    "randint": "IRAND",
-    "bool": "BOOL",
-    "int": "INT",
-    "frac": "FRAC",
-}
-
-
 class Analyzer(ast.NodeVisitor):
-    def __init__(self, indent=0, input_file='', context=None):
+    def __init__(self, indent=0, input_file='', context=None, prepass=None):
         self.input_file = input_file
-        self.contents = io.StringIO()
         self.indent = indent
         self.context = context
         self.stack = []
         self.defined = []
-        self.zbrush = []
+        self.prepass = prepass # an instance of the prepass visitor which collects all the function calls
+
+
+        # these are functions which we recognize in input calls and convert to their
+        # zbrush equivalents.  Not all have exact equivalents -- some zbrush
+        # functions are represents by python syntac instead
+
+        # todo: As written we only check these against the name of a call, ie,
+        # it could be 'zrush.sin()` or `math.sin()` in the python side.  We should
+        # probably regularize that for consistency & readability
+
         self.funcs = {
-            'array': 'VarDef',
+            "sin": "SIN",
+            "cos": "COS",
+            "tan": "TAN",
+            "asin": "ASIN",
+            "acos": "ACOS",
+            "atan": "ATAN",
+            "atan2": "ATAN2",
+            "log": "LOG",
+            "log10": "LOG10",
+            "sqrt": "SQRT",
+            "abs": "ABS",
+            "random": "RAND",
+            "randint": "IRAND",
+            "bool": "BOOL",
+            "int": "INT",
+            "frac": "FRAC",
             'min': 'MIN',
             'max': 'MAX'
         }
-
-        self.funcs.update(**KNOWN_MATH_FUNCS)
 
         self.top_level_defs = []
 
@@ -62,6 +60,7 @@ class Analyzer(ast.NodeVisitor):
             self.defined = self.context.defined
             self.funcs = self.context.funcs
             self.top_level_defs = self.context.top_level_defs
+            self.prepass = self.context.prepass
 
     def format(self):
         "newline separated list, with tabs"
@@ -120,6 +119,8 @@ class Analyzer(ast.NodeVisitor):
         self.stack.append("")
         self.stack.append(f'[Loop, {loop_max},')
         loop_parser = self.sub_parser(*node.body)
+        if self.context:
+            loop_parser.indent += 1
 
         # loop body
         self.stack.append(loop_parser.format())
@@ -344,6 +345,8 @@ class Analyzer(ast.NodeVisitor):
             # it's a zbrush function.  de-alias in possible and return
             if func_name in self.funcs:
                 func_name = self.funcs.get(node.func.id, func_name)
+                sig = self.prepass.get_signature(func_name)
+                logger.info(f'zbrush signature for {func_name}:\n\t {sig}')
 
             func_string = f'[{func_name}{arg_string}]'
             self.stack.append(func_string)
@@ -461,112 +464,110 @@ class Analyzer(ast.NodeVisitor):
                     f"[VarSet, {varname}({idx}), {self.as_literal(item)}]")
 
     def visit_Assign(self, node):
+        logger.debug(f"assign (line {node.lineno})")
 
         varval = (node.value)
         varname = (node.targets[0].id)
         setter = self.get_setter(varname)
 
         if isinstance(varval, ast.BinOp) and isinstance(varval.left, ast.List):
+            #eg, xxx = [0] * 10
             self.handle_array_assign(node)
             return
 
         if isinstance(varval, ast.List):
+            # eg xxx = [1,2,3]
             self.handle_array_assign(node)
             return
 
         if type(varval) in (ast.Num, ast.Str, ast.Name):
+            # xxx = "A" 
+            # xxx = 1
+            # xxx = some_variable  
             varval = self.as_literal(varval)
-        elif isinstance(varval, ast.UnaryOp):
+            self.stack.append(f'[{setter}, {varname}, {varval}]')
+            return
 
-            if isinstance(varval.op, ast.USub):
+        if isinstance(varval, ast.BinOp):
+            # xxx = a + b , etc
+            parser = self.sub_parser(varval)
+            subval = parser.format_inline()
+            self.stack.append(f'[{setter}, {varname}, {subval}]')
+            return
+
+        if isinstance(varval, ast.UnaryOp) and isinstance(varval.op, ast.USub):
+            target = self.as_literal(varval.operand)
+            if isinstance(varval.operand, ast.Num):
+                # a = -1 -> [VarSet, a, -1]
+                self.stack.append (f"[{setter}, {varname}, -{target}]")
+            else:  
+                # a = -b -> [VarSet, a, [NEG, #b]]
                 target = self.as_literal(varval.operand)
                 self.stack.append (f"[{setter}, {varname}, [NEG, {target}]]")
+            return
+
+        if not isinstance(varval, ast.Call):
+            self.abort(f"can't parse {varval}", node)
+
+        # below here, we know it's a function call
+        # that must be either a zbrush function with a return type
+        # a math function (like 'sin' or 'cos')
+        # or a memory read
+
+        prefix, name = self.prepass.get_call_name(varval)
+        logger.debug(f"assign call {prefix}.{name}")
+
+        has_return = self.prepass.has_return_type(varval)
+    
+        logger.debug(f"is zfunc with return: {has_return}")
+        if isinstance(varval.func, ast.Attribute):
+            var_root = varname.split("(")[0]
+            if self.context or (var_root in self.top_level_defs):
+                setter = 'VarSet'
+            else:
+                setter = 'VarDef'
+                self.top_level_defs.append(var_root)
+
+            caller = varval.func.value.id
+
+            is_mem_create = varval.func.attr == 'MemCreate'
+
+            if is_mem_create:
+                arg_parser = self.sub_parser(*varval.args)
+                arg_string = arg_parser.format_inline()
+                if arg_string:
+                    arg_string = ", " + arg_string
+
+                self.stack.append(f'[MemCreate, {varname}{arg_string}]')
                 return
 
-        elif isinstance(varval, ast.Call):
-            # odo - refactor this out
+            arg_parse = self.sub_parser(*varval.args, func=True)
+            if not has_return:
+                
+                mem_name, mem_op = self.format_mem_op(name)
+                if not mem_name:
+                    self.abort("can only call zbrush functions or memory block functions in an assignment", node)
 
-            if isinstance(varval.func, ast.Attribute):
-                var_root = varname.split("(")[0]
-                if self.context or (var_root in self.top_level_defs):
-                    setter = 'VarSet'
-                else:
-                    setter = 'VarDef'
-                    self.top_level_defs.append(var_root)
-
-                caller = ", " + varval.func.value.id
-
-                is_mem_create = varval.func.attr == 'MemCreate'
-
-                if is_mem_create:
-                    arg_parser = self.sub_parser(*varval.args)
-                    arg_string = arg_parser.format_inline()
-                    if arg_string:
-                        arg_string = ", " + arg_string
-
-                    self.stack.append(f'[MemCreate, {varname}{arg_string}]')
-                    return
-
-                allowed_funcs = (
-                    "read_",
-                )
-
-                is_allowed = False
-                for f in allowed_funcs:
-                    is_allowed = is_allowed or f in varval.func.attr
-
-                if (not is_allowed and varval.func.attr not in self.funcs):
-                    self.abort(
-                        "can only call zbrush functions or memory block functions in an assignment", node)
-
-                if varval.func.attr in self.funcs:
-                    m_name = self.funcs[varval.func.attr]
-                    typecode = None
-                    caller = ""
-                else:
-                    # it's a memory object functon
-                    m_name, typecode = self.format_mem_op(varval.func.attr)
-                    if not m_name:
-                        self.abort(
-                            f"Unrecognized memory operation {varval.func.attr}",  node)
-
-                arg_parse = self.sub_parser(*varval.args, func=True)
                 args = arg_parse.stack
-                if typecode:
-                    args.insert(1, typecode)
+                if mem_op:
+                    args.insert(1, mem_op)
                 tail = ''
                 if args:
                     tail = ", ".join(args)
                     tail = ", " + tail
-                self.stack.append(
-                    f'[{setter}, {varname}, [{m_name}{caller}{tail}]]')
+                self.stack.append(f'[{setter}, {varname}, [{mem_name}, {caller}{tail}]]')
                 return
             else:
-                if varval.func.id == "len":
-                    # is a pound sign needed here?
-                    self.stack.append(
-                        f"[VarSet, {varname}, [VarSize, {varval.args[0].id}]]")
-                    return
-                elif varval.func.id in self.funcs:
-                    args  = [str(self.as_literal(v)) for v in varval.args]
-                    if args:
-                        args = ", ".join(args)
+                _, funcname = self.prepass.get_call_name(varval)
+                z_name = self.prepass.zbrush_aliases[funcname]
+                args = arg_parse.stack
+                tail = ''
+                if args:
+                    tail = ", ".join(args)
+                    tail = ", " + tail
+                self.stack.append(f'[{setter}, {varname}, [{z_name}{tail}]]')
 
-                    func_name = self.funcs.get(varval.func.id)
-                    self.stack.append(f'[{setter}, {varname}, [{func_name}, {args}]]')
-                    return
-            self.abort("Can't assign a function call in ZBrush", varval)
 
-        elif isinstance(varval, ast.BinOp):
-            parser = self.sub_parser(varval)
-            varval = parser.format_inline()
-
-        if not self.context and varval not in self.defined:
-            setter = f'[VarDef, {varname}, {varval}]'
-            self.defined.append(varname)
-        else:
-            setter = f"[VarSet, {varname}, {varval}]"
-        self.stack.append(setter)
 
     def visit_Lt(self, node):
         self.stack.append(" < ")
@@ -614,7 +615,11 @@ class Analyzer(ast.NodeVisitor):
             self.stack.append(comp)
 
     def visit_While(self, node):
-
+        # ZScript does not support a while loop.  So, we
+        # loop a finite number of times checking the exit 
+        # condifition. 
+        # Todo:  rather than using int16 (65535) as the 
+        # loop, allow user to set it with a constant from code?
         breakout = ast.If(
             test=node.test,
             body=[ast.Expr(value=ast.Continue())],
@@ -630,13 +635,19 @@ class Analyzer(ast.NodeVisitor):
                           ctx=ast.Load(), args=[ast.Num(n=65534)]),
             body=body_block
         )
-        try:
-            self.indent -= 1
-            subp = self.sub_parser(new_node)
+        #try:
+            #self.indent -= 1
+        subp = self.sub_parser(new_node)
+        if not self.context:
             subp.indent -= 1
-            self.stack.append(subp.format())
-        finally:
-            self.indent += 1
+            #if not self.context:
+            #    subp.indent -= 1
+        self.stack.append(subp.format())
+        #finally:
+            #self.indent += 1
+
+
+
 
     def report(self):
         for item in self.stack:
@@ -654,7 +665,7 @@ class Analyzer(ast.NodeVisitor):
 
     def sub_parser(self, *args, **kwargs):
         if kwargs.get('func'):
-            sub_parser = FunctionAnalyzer(context=self)
+            sub_parser = FunctionAnalyzer(context=self, prepass=self.prepass)
         else:
             sub_parser = Analyzer(context=self)
         sub_parser.indent += 1
@@ -669,8 +680,21 @@ class FunctionAnalyzer(Analyzer):
     """
 
     def visit_Name(self, node):
-        # Q - should this use the # prefix?
-        self.stack.append(node.id)
+        if self.prepass.is_user_function(node):
+            # for UI Elements or other items that expect command lists,
+            # python code should make a no-arg function and pass it 
+            # directly, ie,
+            # 
+            #   def test():
+            #       zbrush.Note("OK") 
+            #
+            #   zBrush.IButton("Test", "", test)
+
+            self.stack.append(f"[RoutineCall, {node.id}]")
+        else:
+            # for variables passed as arguments to a function, use the # prefix
+            self.stack.append(f"#{node.id}")
+
 
 
 def compile(filename, out_filename=''):
@@ -679,7 +703,14 @@ def compile(filename, out_filename=''):
         input_file = source.read()
 
     tree = ast.parse(input_file)
-    analyzer = Analyzer(0, input_file=input_file)
+
+    prepass = Prepass()
+    prepass.visit(tree)
+
+    print (prepass.user_functions)
+    print (prepass.module_aliases)
+
+    analyzer = Analyzer(0, input_file=input_file, prepass=prepass)
     analyzer.visit(tree)
 
     out_filename = out_filename or filename.replace('.py', '.txt')
@@ -688,27 +719,8 @@ def compile(filename, out_filename=''):
         tp = (f'transpiled with zsc {VERSION}')
         orig = f'from: {filename}'
 
-        output.write(f"/*\n{tp}\n{orig}\n*/\n\n")
+        output.write(f"// {tp}\n// {orig}\n")
         output.write(analyzer.format())
 
     return out_filename, analyzer.format()
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        prog="zsc",
-        description=f'Python to ZScript transpiler ({VERSION})'
-    )
-    parser.add_argument("input", help="path to python source file")
-    parser.add_argument(
-        "--output", help="optional output file (otherwise, uses the same name as the input file with .txt extension)")
-    parser.add_argument(
-        "--show", help="if true, print the transpiled file to stdout", action='store_true')
-
-    args = parser.parse_args()
-    output, result = compile(args.input, out_filename=args.output or '')
-
-    if args.show:
-        print(result)
-    else:
-        print(output)
