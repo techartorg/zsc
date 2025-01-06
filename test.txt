@@ -1,0 +1,122 @@
+/*
+transpiled with zsc 0.1.0
+from: test.py
+*/
+
+// automatic return vars
+
+[RoutineDef, check_script_version,
+    [VarSet, gScriptVersion, [ZbrushInfo, 0]]
+] // end check_script_version
+
+
+[RoutineDef, test_func,
+    [RoutineCall, print, #arg]
+    , // args 
+    arg, arg2
+] // end test_func
+
+
+[RoutineDef, fred,
+    [MemCreate, , "other", 100, "A"]
+    // blockID = memblock
+    [VarSet, memblock, [MemCreate, memblock, 100, 'A']]
+    [MemWrite, , memblock, 0, "A", 1]
+    [VarSet, goof, [MemRead, memblock, 0, 'A', 1]]
+    [VarSet, test, [ToolGetActiveIndex]]
+    [VarSet, subtooltst, [GetSubToolIndex, 2]]
+    [VarSet, allowed, [MAX, , 1, 2]]
+    [RoutineCall, test_return_string, #barney, josh]
+    [RoutineCall, print, #josh]
+    [RoutineCall, test_return_float, #barney, xxxx]
+    [RoutineCall, print, #xxxx]
+    [RoutineCall, test_return_int, #barney, wilma]
+    // random internal comment
+] // end fred
+
+
+[RoutineDef, test_loop,
+    
+    [Loop, 10,
+            
+        [If, ([Var, x] = 5),
+            // then...
+            [Exit]
+            , // else
+            
+    [If, ([Var, x]34),
+        // then...
+        [LoopContinue]
+        , // else
+    
+    ]
+    [RoutineCall, print, #x]
+        ]
+        ,
+    x ] // loop end
+] // end test_loop
+
+
+[RoutineDef, array_contains,
+    [VarSet, loopsize, [VarSize, #arr]]
+    [Exit]
+    , // args 
+    arr, val, _auto_return
+] // end array_contains
+
+
+[RoutineDef, test_array_contains,
+    [RoutineCall, array_contains, #arr, #val, result]
+    , // args 
+    arr, val
+] // end test_array_contains
+
+
+[RoutineDef, test_while,
+    // random internal comment
+    
+[Loop, 65534,
+        
+        [If, ([Var, val] = [Var, cutoff]),
+            // then...
+            [Exit]
+            , // else
+        
+        ]
+        [VarAdd, val, 1]
+        
+        [If, ([Var, val] < [Var, iterations]),
+            // then...
+            [LoopContinue]
+            , // else
+            [LoopExit]
+        ]
+    ,
+WhileLoop ] // loop end
+    , // args 
+    iterations, cutoff
+] // end test_while
+
+
+// convert 'return val' to return an automatic value 
+[RoutineDef, test_return_string,
+    [Exit]
+    , // args 
+    arg, _auto_return
+] // end test_return_string
+
+
+// convert 'return val' to return an automatic value 
+[RoutineDef, test_return_float,
+    [Exit]
+    , // args 
+    arg, _auto_return
+] // end test_return_float
+
+
+// convert 'return val' to return an automatic value 
+[RoutineDef, test_return_int,
+    [Exit]
+    , // args 
+    arg, _auto_return
+] // end test_return_int
