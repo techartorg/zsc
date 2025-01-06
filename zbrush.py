@@ -8,7 +8,7 @@ Conventions:
     * Most inputs are strings or numbers; here they are specified as str, float or int but in
       zbrush they are all ascii strings or 'numbers' unless specified
         * there's no unicode nonsense in zbrush, all strings are ascii or utf-8
-    * references to memeory blocks use the MemBlock type hint
+    * references to memory blocks use the MemBlock type hint
     * references to StrokeData use the StrokeData or MultipleStrokeData type hints
 
 Not all functions in the zscript command list are represented directly as functions.  The ones that

@@ -55,6 +55,12 @@ def collect_signatures(tree):
 
 
 class Analyzer(ast.NodeVisitor):
+
+    USER = "user_function"
+    ZB = "zbrush_function"
+    MEM = "zbrush mem function"
+    TRANSLATE = "translated function"
+
     def __init__(self, indent=0, input_file="", context=None, return_types=None):
         self.input_file = input_file
         self.contents = io.StringIO()
@@ -95,6 +101,34 @@ class Analyzer(ast.NodeVisitor):
     def tab(self, extra=0):
         return "    " * (self.indent + extra)
 
+    def get_assignment_info(self, callnode):
+        is_attrib = isinstance(callnode.func, ast.Attribute)
+        if hasattr(callnode.func, "value"):
+            owner_name = callnode.func.value.id
+            func_name = callnode.func.attr
+        else:
+            owner_name = ""
+            func_name = callnode.func.id
+
+        is_mem_call = func_name.startswith("Mem")
+        info = {
+            "is_attrib": is_attrib,
+            "owner_name": owner_name,
+            "func_name": func_name,
+            "is_mem_call": is_mem_call,
+            "type": None,
+            "args": [self.as_literal(a) for a in callnode.args],
+        }
+
+        if not is_attrib:
+            if func_name in self.funcs:
+                info["type"] = self.TRANSLATE
+            else:
+                info["type"] = self.USER
+            return info
+        info["type"] = self.MEM if is_mem_call else self.ZB
+        return info
+
     def visit_Import(self, node):
 
         for name in node.names:
@@ -134,18 +168,24 @@ class Analyzer(ast.NodeVisitor):
         ):
             self.abort("use range() to set loop iterations", node)
 
-        loop_max = iterator.args[0].n
+        if len(iterator.args) > 1:
+            self.abort("range() only takes one argument", node)
+        loop_max = 0
+        if hasattr(iterator.args[0], "n"):
+            loop_max = iterator.args[0].n
+        else:
+            loop_max = iterator.args[0].id
         loop_var = node.target.id
-
         self.stack.append("")
         self.stack.append(f"[Loop, {loop_max},")
+
         loop_parser = self.sub_parser(*node.body)
+        loop_parser.indent += 1
 
         # loop body
         self.stack.append(loop_parser.format())
         self.stack.append(self.tab() + ",")
-        self.stack.append(self.tab() + f"{loop_var}")
-        self.stack.append("] // loop end")
+        self.stack.append(f"{loop_var} ] // loop end")
 
     def visit_Continue(self, node):
         self.stack.append("[LoopContinue]")
@@ -183,9 +223,13 @@ class Analyzer(ast.NodeVisitor):
                         targets=[ast.Name("_auto_return")], value=return_node.value
                     )
                 )
+                node.body.append(ast.Return(value=None))
 
             else:
-                self.abort("return statement", return_node)
+                self.abort(
+                    "zbrush functions don't use retrun values, consider AUTO_RETURN",
+                    return_node,
+                )
         arg_string = ", ".join(incoming_args)
 
         self.stack.append("[RoutineDef, {},".format(node.name))
@@ -280,7 +324,7 @@ class Analyzer(ast.NodeVisitor):
             target = self.as_literal(node.operand)
             self.stack.append(f"[NEG,{target} ]")
             return
-        raise RuntimeError(f"Unsuporter oprations {node.op}")
+        raise RuntimeError(f"Unsupported operator: {node.op}")
 
     def visit_AugAssign(self, node):
         """
@@ -296,9 +340,7 @@ class Analyzer(ast.NodeVisitor):
         try:
             opstring = op[type(node.op)]
         except:
-            self.abort(
-                "ZBrush does not support augmented operator {}".format(node.op), node
-            )
+            self.abort(f"ZBrush does not support augmented operator {node.op}", node)
 
         target_var = node.target.id
         val = node.value
@@ -333,6 +375,7 @@ class Analyzer(ast.NodeVisitor):
         m_name, _, m_type = method.partition("_")
 
         if m_name not in (
+            "create",
             "read",
             "write",
             "resize",
@@ -360,6 +403,15 @@ class Analyzer(ast.NodeVisitor):
 
     def visit_Call(self, node):
 
+        info = self.get_assignment_info(node)
+        if info["type"] == self.USER:
+            args = [self.as_literal(a) for a in node.args]
+            args = ", ".join(args)
+            if args:
+                args = ", " + args
+            self.stack.append(f"[RoutineCall, {info['func_name']}{args}]")
+            return
+
         is_attrib = isinstance(node.func, ast.Attribute)
         is_zb = False  # is this a recognized call
         is_mem_call = False
@@ -385,7 +437,7 @@ class Analyzer(ast.NodeVisitor):
             if func_name in self.funcs:
                 func_name = self.funcs.get(node.func.id, func_name)
 
-            func_string = f"[{func_name}{arg_string}]"
+            func_string = f"[{func_name}, {arg_string}]"
             self.stack.append(func_string)
             return
 
@@ -430,8 +482,7 @@ class Analyzer(ast.NodeVisitor):
             return val.n
         if isinstance(val, ast.Name):
             return f"#{val.id}"
-
-        raise ValueError(f"cannot parse {val} as literal")
+        return str(val)
 
     def handle_array_assign(self, node):
         """
@@ -527,118 +578,73 @@ class Analyzer(ast.NodeVisitor):
 
         elif isinstance(varval, ast.Call):
             # odo - refactor this out
+            info = self.get_assignment_info(varval)
+            handler = {
+                self.USER: self.visit_user_assign,
+                self.ZB: self.visit_zbrush_assign,
+                self.MEM: self.visit_mem_assign,
+                self.TRANSLATE: self.visit_translate_assign,
+            }
 
-            if isinstance(varval.func, ast.Attribute):
+            process = handler.get(info["type"])
+            process(varval, varname, setter, info)
 
-                var_root = varname.split("(")[0]
-                if self.context or (var_root in self.top_level_defs):
-                    setter = "VarSet"
-                else:
-                    setter = "VarDef"
-                    self.top_level_defs.append(var_root)
-
-                caller = ", " + varval.func.value.id
-
-                is_mem_create = varval.func.attr == "MemCreate"
-
-                #  we treat memory block creation as assignemnt
-                # because they return an id
-                if is_mem_create:
-                    arg_parser = self.sub_parser(*varval.args)
-                    arg_string = arg_parser.format_inline()
-                    if arg_string:
-                        arg_string = ", " + arg_string
-
-                    self.stack.append(f"[MemCreate, {varname}{arg_string}]")
-                    return
-
-                # we also allow assignments from memory reads
-                # and the 'allowed_funcs' list
-                allowed_funcs = ("read_",)
-                is_allowed = False
-                for f in allowed_funcs:
-                    is_allowed = is_allowed or f in varval.func.attr
-
-                # we can assign to zbrush functions
-                # todo: make a list of the allowable functions
-                is_allowed = is_allowed or varval.func.value.id == "zbrush"
-
-                if not is_allowed:
-                    raise CompilerError(f"Unrecognized function {varval.func.attr}")
-
-                if varval.func.attr in self.funcs:
-                    m_name = self.funcs[varval.func.attr]
-                    typecode = None
-                    caller = ""
-                else:
-                    # it's a memory object functon
-                    m_name, typecode = self.format_mem_op(varval.func.attr)
-                    if not m_name:
-                        self.abort(
-                            f"Unrecognized memory operation {varval.func.attr}",
-                            node,
-                        )
-
-                arg_parse = self.sub_parser(*varval.args, func=True)
-                args = arg_parse.stack
-                if typecode:
-                    args.insert(1, typecode)
-                tail = ""
-                if args:
-                    tail = ", ".join(args)
-                    tail = ", " + tail
-                self.stack.append(f"[{setter}, {varname}, [{m_name}{caller}{tail}]]")
-                return
-            else:
-                if varval.func.id == "len":
-                    # is a pound sign needed here?
-                    self.stack.append(
-                        f"[VarSet, {varname}, [VarSize, {varval.args[0].id}]]"
-                    )
-                    return
-                elif varval.func.id in self.funcs:
-                    args = [str(self.as_literal(v)) for v in varval.args]
-                    if args:
-                        args = ", ".join(args)
-
-                    func_name = self.funcs.get(varval.func.id)
-                    self.stack.append(f"[{setter}, {varname}, [{func_name}, {args}]]")
-                    return
-
-            # if we aren't adding returns, we can't assign function calls
-            if not AUTO_RETURN:
-                self.abort("Can't assign a function call in ZBrush", varval)
-            else:
-                """
-                For auto-return functions, we create a variable to hold the return value,
-                add an argument to the func def, and then call it.
-
-                @todo: inspect the outer context to get the right variable type
-                """
-
-                return_type = self.return_types.get(varval.func.id, 0)
-
-                default = {"str": '""', "int": "0", "float": "0.0", None: 0}.get(
-                    self.return_types.get(varval.func.id)
-                )
-
-                self.stack.append(f"//begin auto return")
-                self.stack.append(f"[VarSet, {varname}, {default}]")
-                varval.args.append(ast.Name(varname))
-                self.visit_Call(varval)
-                self.stack.append(f"//end auto return")
-                return
-
-        elif isinstance(varval, ast.BinOp):
-            parser = self.sub_parser(varval)
-            varval = parser.format_inline()
-
-        if not self.context and varval not in self.defined:
-            setter = f"[VarDef, {varname}, {varval}]"
-            self.defined.append(varname)
+    def visit_user_assign(self, varval, varname, setter, info):
+        if not AUTO_RETURN:
+            self.abort("Can't assign a user-defined function call in ZBrush", varval)
         else:
-            setter = f"[VarSet, {varname}, {varval}]"
-        self.stack.append(setter)
+            """
+            For auto-return functions, we create a variable to hold the return value,
+            add an argument to the func def, and then call it.
+
+            @todo: inspect the outer context to get the right variable type
+            """
+            return_type = self.return_types.get(varval.func.id, 0)
+
+            default = {"str": '""', "int": "0", "float": "0.0", None: 0}.get(
+                self.return_types.get(varval.func.id)
+            )
+
+            """got to untangle this"""
+            # print(ast.dump(varval))
+            # varval.body.append(f"[{setter}, {varname}, {default}] // autoreturn")
+            varval.args.append(varname)
+            self.visit_Call(varval)
+            return
+
+    def visit_zbrush_assign(self, varval, varname, setter, info):
+        zbr_args = info["func_name"]
+        if info["args"]:
+            zbr_args += ", "
+            zbr_args += ", ".join(info["args"])
+
+        self.stack.append(f"[{setter}, {varname}, [{zbr_args}]]")
+
+        return
+
+    def visit_translate_assign(self, varval, varname, setter, info):
+        zfunc = KNOWN_MATH_FUNCS.get(info["func_name"])
+        sub_parser = self.sub_parser(varval)
+        processed_args = sub_parser.format_inline()
+        self.stack.append(f"[{setter}, {varname}, {processed_args}]")
+        return
+
+    def visit_mem_assign(self, varval, varname, setter, info):
+
+        op = info["func_name"]
+        args = info["args"]
+        args[0] = str(args[0]).replace("#", "")
+        arg_string = ", ".join(args)
+        # make sure tht the first argument s not
+        # a variable reference or a string
+        initial, rest = arg_string.split(",", 1)
+        initial = initial.replace("#", "")
+        initial = initial.replace("'", "")
+        arg_string = initial + "," + rest
+        if op == "MemCreate":
+            self.stack.append(f"// blockID = {initial}")
+        self.stack.append(f"[{setter}, {varname}, [{op}, {arg_string}]]")
+        return
 
     def visit_Lt(self, node):
         self.stack.append(" < ")
@@ -647,7 +653,7 @@ class Analyzer(ast.NodeVisitor):
         self.stack.append(" > ")
 
     def visit_Lte(self, node):
-        self.stack.append(" <=")
+        self.stack.append(" <= ")
 
     def visit_Gte(self, node):
         self.stack.append(" >= ")
